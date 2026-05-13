@@ -1,0 +1,612 @@
+<script>
+let dados = [];
+let html5QrCode = null;
+let isScanning = false;
+let logos = {};
+let cores = {};
+let historicoLeituras = [];
+let timerReset = null;
+let audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+let conflitoTemp = null;
+
+// ==========================================
+// CALCULADORA DE CONTRASTE AUTOMÁTICO (FRONTEND)
+// ==========================================
+function getCorTexto(hexColor) {
+  if (!hexColor) return '#1a1a1a'; 
+  let hex = hexColor.replace("#", "");
+  if (hex.length === 3) hex = hex.split('').map(h => h + h).join('');
+  let r = parseInt(hex.substr(0, 2), 16);
+  let g = parseInt(hex.substr(2, 2), 16);
+  let b = parseInt(hex.substr(4, 2), 16);
+  let yiq = ((r * 299) + (g * 587) + (b * 114)) / 1000;
+  return (yiq >= 128) ? '#1a1a1a' : '#ffffff'; 
+}
+
+function showToast(msg, tipo) {
+  const div = document.getElementById('toastArea');
+  div.innerHTML = `<div class="toast ${tipo === 'success' ? 'toast-ok' : 'toast-err'}">${msg}</div>`;
+  setTimeout(() => div.innerHTML = '', 3000);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  google.script.run.withSuccessHandler(ts => {
+    const sel = document.getElementById('turnoGlobal');
+    sel.innerHTML = '';
+    ts.forEach(t => {
+      let opt = document.createElement('option');
+      opt.value = t.nome; opt.textContent = t.nome.toUpperCase();
+      sel.appendChild(opt);
+    });
+    carregarDados();
+  }).getColunasFrequencia();
+
+  google.script.run.withSuccessHandler(l => {
+    logos = l;
+    if(l.logo1) { document.getElementById('logo1').style.backgroundImage = `url(${l.logo1})`; document.getElementById('logo1').innerHTML=""; }
+    if(l.logo2) { document.getElementById('logo2').style.backgroundImage = `url(${l.logo2})`; document.getElementById('logo2').innerHTML=""; }
+  }).carregarLogos();
+  
+  google.script.run.withSuccessHandler(c => {
+    if(c) {
+      if(c.data) document.getElementById('data').value = c.data;
+      if(c.municipio) document.getElementById('municipio').value = c.municipio;
+    }
+  }).carregarConfiguracoes();
+});
+
+function salvarConfigsAuto() {
+  const d = { data: document.getElementById('data').value, municipio: document.getElementById('municipio').value };
+  google.script.run.salvarConfiguracoes(d);
+}
+
+function carregarDados() {
+  google.script.run.withSuccessHandler(d => {
+    dados = d; atualizarSelectTurmas(); atualizarTabela();
+  }).getTodasPessoas();
+}
+
+function atualizarSelectTurmas() {
+  google.script.run.withSuccessHandler(turmas => {
+    const sel = document.getElementById('turmaFiltro');
+    const atual = sel.value;
+    sel.innerHTML = '<option value="">Selecione a Turma...</option>';
+    turmas.forEach(t => {
+      cores[t.nome] = t.cor; 
+      let opt = document.createElement('option');
+      opt.value = t.nome; opt.textContent = t.nome;
+      if(t.nome === atual) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    aplicarCor();
+  }).getTurmas();
+}
+
+function mudarTurma() { aplicarCor(); atualizarTabela(); }
+
+function aplicarCor() {
+  const sel = document.getElementById('turmaFiltro');
+  const nome = sel.value;
+  if(nome && cores[nome]) {
+    let corIdeal = getCorTexto(cores[nome]); // Chama a calculadora!
+    sel.style.backgroundColor = cores[nome]; 
+    sel.style.color = corIdeal; // Aplica o contraste perfeito
+    sel.style.borderColor = cores[nome];
+  } else {
+    sel.style.backgroundColor = "white"; 
+    sel.style.color = "black"; 
+    sel.style.borderColor = "#ccc";
+  }
+}
+
+function atualizarTabela() {
+  const tbody = document.getElementById('tbody');
+  const turma = document.getElementById('turmaFiltro').value;
+  const turno = document.getElementById('turnoGlobal').value;
+  document.getElementById('lblTurno').textContent = turno ? turno.toUpperCase() : '---';
+
+  if(!turma) { tbody.innerHTML = "<tr><td colspan='4' align='center' style='padding:40px; color:#666;'>Selecione a turma acima para listar os alunos.</td></tr>"; return; }
+  if(!turno) { tbody.innerHTML = "<tr><td colspan='4' align='center' style='padding:40px; color:red; font-weight:bold;'>Crie colunas de turno no banco de dados!</td></tr>"; return; }
+
+  const filtrados = dados.filter(p => p.turma === turma); 
+  let html = '';
+  
+  filtrados.forEach((p, i) => {
+    const status = (p.frequencias && p.frequencias[turno]) || 'Faltou';
+    const isOn = status === 'Presente';
+    const count = dados.filter(x => x.aluno.toLowerCase() === p.aluno.toLowerCase() && x.id === p.id).length;
+    const isDupe = count > 1; 
+    
+    html += `<tr class="${isDupe ? 'aluno-duplicado' : ''}">
+      <td align="center">${i+1}</td>
+      <td class="nome-aluno" onclick="editarNome('${p.id}', '${p.aluno.replace(/'/g, "\\'")}')">${p.aluno} ${isDupe?'<span style="font-size:12px;color:#f39c12;">(Em outra turma)</span>':''}</td>
+      <td align="center">
+        <div class="switch ${isOn ? 'on' : ''}" onclick="clickManual(this, '${p.id}', '${turno}', ${!isOn})">
+          <div class="slider"></div>
+        </div>
+      </td>
+      <td align="center"><button class="btn-del" onclick="remover('${p.id}', '${p.aluno.replace(/'/g, "\\'")}')" title="Excluir Aluno">X</button></td>
+    </tr>`;
+  });
+  html += `<tr class="row-add" onclick="openAddModal()"><td>+</td><td colspan="3" style="padding:15px;">Adicionar Novo Aluno</td></tr>`;
+  tbody.innerHTML = html;
+}
+
+function clickManual(el, id, turno, novoEstado) {
+  if(el.classList.contains('processando')) return; 
+  el.classList.add('processando');
+  
+  const valor = novoEstado ? "Presente" : "Faltou";
+  google.script.run.withSuccessHandler(res => {
+    el.classList.remove('processando');
+    if(res.success) {
+      if(novoEstado) el.classList.add('on'); else el.classList.remove('on');
+      dados.forEach(p => { if(p.id == id) { if(!p.frequencias) p.frequencias={}; p.frequencias[turno] = valor; }});
+      if(document.getElementById('turmaFiltro').value) atualizarTabela();
+    } else { showToast(res.message, "error"); }
+  }).atualizarFrequenciaIndividual(id, turno, valor);
+}
+
+function renderHistory() {
+  const container = document.getElementById('historyList');
+  if (historicoLeituras.length === 0) {
+      container.innerHTML = '<div style="font-size:11px; color:#999; text-align:center; padding:10px;">Nenhuma leitura recente</div>';
+      return;
+  }
+  let html = '';
+  historicoLeituras.forEach(h => {
+      html += `
+      <div style="display:flex; align-items:center; gap:8px; padding:6px; background:#f9f9f9; border-radius:5px; border-left:4px solid ${h.cor}; font-size:12px;">
+          <div style="flex:1; font-weight:bold; color:#333; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${h.nome}</div>
+          <div style="font-size:10px; color:#666; background:#eee; padding:2px 6px; border-radius:10px;">${h.turma}</div>
+      </div>`;
+  });
+  container.innerHTML = html;
+}
+
+function resetScannerUI() {
+  document.getElementById('fbCard').classList.remove('active');
+  document.getElementById('fbNome').textContent = "Aguardando leitura...";
+  document.getElementById('fbTurma').textContent = "---";
+  document.getElementById('fbStatus').style.opacity = 0;
+  document.getElementById('fbCor').style.backgroundColor = "#ccc";
+  document.getElementById('fbCor').style.borderColor = "#555";
+}
+
+
+// ==========================================
+// CÂMERA AO VIVO COM FURADOR DE IFRAME (Permissão Forçada)
+// ==========================================
+function toggleScanner() {
+  const btn = document.getElementById('btnCam');
+  
+  if (isScanning) {
+    if (html5QrCode) {
+      html5QrCode.stop().then(() => { 
+        isScanning = false; 
+        btn.textContent = "INICIAR CÂMERA AO VIVO"; 
+        btn.style.backgroundColor = "#3498db"; 
+        clearTimeout(timerReset); 
+        resetScannerUI(); 
+      }).catch(e => console.log(e));
+    }
+    return;
+  } 
+
+  btn.textContent = "PEDINDO PERMISSÃO...";
+  
+  // TRUQUE: Pede permissão bruta primeiro para furar o bloqueio do Iframe do Google
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+    .then(function(stream) {
+      // Permissão concedida! Desliga a câmera rápida só para passar pro leitor
+      stream.getTracks().forEach(track => track.stop());
+      
+      // Agora que furou o bloqueio, liga o leitor visual
+      if (!html5QrCode) { html5QrCode = new Html5Qrcode("reader"); }
+      
+      btn.textContent = "ABRINDO LEITOR...";
+      
+      html5QrCode.start(
+        { facingMode: "environment" }, 
+        { fps: 10, qrbox: { width: 250, height: 250 } }, 
+        onScan, 
+        (err) => {} // Ignora logs de frame vazio
+      ).then(() => {
+        isScanning = true; 
+        btn.textContent = "PARAR CÂMERA"; 
+        btn.style.background = "#e74c3c";
+      }).catch(err => {
+        btn.textContent = "INICIAR CÂMERA AO VIVO";
+        alert("Erro ao iniciar o leitor: " + err);
+      });
+      
+    })
+    .catch(function(err) {
+      btn.textContent = "INICIAR CÂMERA AO VIVO";
+      alert("⚠️ O navegador bloqueou a câmera no Iframe!\n\nErro: " + err.message + "\n\nSe você embutiu esse sistema em outro site, lembre-se de colocar allow=\"camera\" no código do iframe.");
+    });
+}
+
+// Tentativa 2 e 3 (Fallback)
+function iniciarCameraModoSimples(btn) {
+  html5QrCode.start(
+    { facingMode: "environment" }, 
+    { fps: 10, qrbox: { width: 250, height: 250 } }, 
+    onScan,
+    (err) => {} 
+  ).then(() => {
+    isScanning = true; 
+    btn.textContent = "PARAR CÂMERA"; 
+    btn.style.background = "#e74c3c";
+  }).catch(err => {
+    btn.textContent = "INICIAR CÂMERA AO VIVO";
+    alert("⚠️ O navegador continua bloqueando a Câmera Ao Vivo.\n\nPor favor, utilize o botão VERDE logo abaixo ('📸 TIRAR FOTO DO QR CODE'). Ele não depende do navegador e funciona em 100% dos celulares.");
+  });
+}
+
+function onScan(code) {
+  if(document.getElementById('fbCard').classList.contains('lendo')) return;
+  
+  const turno = document.getElementById('turnoGlobal').value;
+  if (!turno || turno === 'Carregando...') return showToast("Selecione um turno primeiro.", "error");
+
+  document.getElementById('fbCard').classList.add('lendo');
+  clearTimeout(timerReset);
+
+  setTimeout(() => {
+    audio.play().catch(e=>console.log(e)); 
+    
+    const codeStr = code.toString();
+    const codigosLidos = codeStr.split(/[\n,;|\/]+/).map(c => c.trim().toLowerCase()).filter(c => c !== '');
+    
+    let pessoasEncontradas = [];
+    
+    codigosLidos.forEach(cod => {
+        const p = dados.find(x => {
+            const idsDb = String(x.id || "").toLowerCase().split(/[\n,;|\/]+/).map(c => c.trim());
+            const cpfsDb = String(x.cpf || "").toLowerCase().split(/[\n,;|\/]+/).map(c => c.trim());
+            const nomeStr = String(x.aluno || "").trim().toLowerCase();
+            
+            if (idsDb.includes(cod) || cpfsDb.includes(cod) || nomeStr === cod) return true;
+            return false;
+        });
+        
+        if (p && !pessoasEncontradas.some(e => e.id === p.id)) {
+            pessoasEncontradas.push(p);
+        }
+    });
+
+    if(pessoasEncontradas.length > 0) {
+      const card = document.getElementById('fbCard');
+      const corBox = document.getElementById('fbCor');
+      const corTurma = cores[pessoasEncontradas[0].turma] || '#ccc';
+      
+      card.classList.add('active');
+      const nomesStr = pessoasEncontradas.map(p => p.aluno).join(' e ');
+      document.getElementById('fbNome').textContent = nomesStr;
+      const turmasUnicas = [...new Set(pessoasEncontradas.map(p => p.turma))].join(' / ');
+      
+      let turmaTxt = turmasUnicas;
+      if (pessoasEncontradas.length === 1 && pessoasEncontradas[0].cpf) {
+          turmaTxt += ` | CPF: ${pessoasEncontradas[0].cpf}`;
+      }
+      document.getElementById('fbTurma').textContent = turmaTxt;
+
+      // Pinta a etiqueta com a cor da turma e aplica o contraste no texto!
+      document.getElementById('fbTurma').style.backgroundColor = corTurma;
+      document.getElementById('fbTurma').style.color = getCorTexto(corTurma);
+      
+      document.getElementById('fbStatus').style.opacity = 1;
+      document.getElementById('fbStatus').textContent = pessoasEncontradas.length > 1 ? `✅ PRESENÇA (${pessoasEncontradas.length})` : "✅ PRESENÇA";
+      document.getElementById('fbStatus').style.color = "#27ae60";
+      
+      corBox.style.backgroundColor = corTurma;
+      corBox.style.borderColor = corTurma;
+      
+      historicoLeituras.unshift({ nome: nomesStr, turma: turmasUnicas, cor: corTurma });
+      if(historicoLeituras.length > 5) historicoLeituras.pop();
+      renderHistory();
+      
+      const idsExatos = pessoasEncontradas.map(p => p.id).join(',');
+      
+      google.script.run.withSuccessHandler(() => {
+        pessoasEncontradas.forEach(p => {
+           dados.forEach(d => { if(d.id == p.id) { if(!d.frequencias) d.frequencias={}; d.frequencias[turno] = "Presente"; }});
+        });
+        if(document.getElementById('turmaFiltro').value) atualizarTabela();
+      }).atualizarFrequenciaIndividual(idsExatos, turno, "Presente");
+      
+    } else {
+      document.getElementById('fbCard').style.opacity = 1;
+      document.getElementById('fbNome').textContent = "Não Encontrado";
+      document.getElementById('fbTurma').textContent = "---";
+      document.getElementById('fbStatus').style.opacity = 1;
+      document.getElementById('fbStatus').textContent = "❌ ERRO DE LEITURA";
+      document.getElementById('fbStatus').style.color = "#e74c3c";
+      document.getElementById('fbCor').style.backgroundColor = "#e74c3c";
+    }
+    
+    setTimeout(() => { document.getElementById('fbCard').classList.remove('lendo', 'active'); document.getElementById('fbStatus').style.opacity = 0; }, 1500);
+    timerReset = setTimeout(resetScannerUI, 20000); 
+  }, 200);
+}
+
+function processarFoto(event) {
+  if (event.target.files.length === 0) return;
+  
+  showToast("Processando a foto, aguarde...", "success");
+  
+  const file = event.target.files[0];
+  const reader = new FileReader();
+  
+  reader.onload = function(e) {
+    const img = new Image();
+    img.onload = function() {
+      // Cria uma tela invisível para diminuir a foto
+      const canvas = document.createElement('canvas');
+      const MAX_SIZE = 800; // Tamanho ideal que o leitor consegue ler rápido
+      let width = img.width;
+      let height = img.height;
+
+      // Calcula a redução mantendo a proporção
+      if (width > height) {
+        if (width > MAX_SIZE) { height *= MAX_SIZE / width; width = MAX_SIZE; }
+      } else {
+        if (height > MAX_SIZE) { width *= MAX_SIZE / height; height = MAX_SIZE; }
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      
+      // Desenha a foto em tamanho reduzido
+      ctx.drawImage(img, 0, 0, width, height);
+      
+      // Converte de volta para arquivo e manda pro leitor
+      canvas.toBlob(function(blob) {
+        const resizedFile = new File([blob], file.name, { type: 'image/jpeg' });
+        
+        if (!html5QrCode) html5QrCode = new Html5Qrcode("reader");
+        
+        html5QrCode.scanFile(resizedFile, true)
+          .then(decodedText => { 
+             onScan(decodedText); 
+          })
+          .catch(err => { 
+             showToast("Não achou o QR Code. Chegue mais perto da folha!", "error"); 
+          });
+          
+      }, 'image/jpeg', 0.8);
+    };
+    img.src = e.target.result;
+  };
+  
+  reader.readAsDataURL(file);
+  event.target.value = '';
+}
+
+function handleLogo(slot) {
+  if (logos[slot]) {
+    if(confirm("Deseja remover esta logo parceira?")) {
+      logos[slot] = null; document.getElementById(slot).style.backgroundImage = 'none';
+      document.getElementById(slot).innerHTML = "Parceiro"; google.script.run.salvarLogos(logos);
+    }
+  } else {
+    const fileInput = document.getElementById('fileInput');
+    fileInput.value = ''; 
+    fileInput.onchange = e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      showToast("Processando imagem...", "success");
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX_WIDTH = 150; 
+          const scaleSize = MAX_WIDTH / img.width;
+          canvas.width = MAX_WIDTH;
+          canvas.height = img.height * scaleSize;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const base64Reduzido = canvas.toDataURL('image/jpeg', 0.7);
+          logos[slot] = base64Reduzido; 
+          document.getElementById(slot).style.backgroundImage = `url(${base64Reduzido})`;
+          document.getElementById(slot).innerHTML = ""; 
+          google.script.run.withSuccessHandler(()=>showToast("Logo salva!", "success")).salvarLogos(logos);
+        };
+        img.src = ev.target.result;
+      };
+      reader.readAsDataURL(file);
+    };
+    document.getElementById('fileInput').click();
+  }
+}
+
+function openAddModal() { 
+  if(!document.getElementById('turmaFiltro').value) return showToast("Selecione a turma na tabela primeiro!", "error");
+  document.getElementById('modalAdd').style.display='flex'; 
+}
+function closeModal(id) { document.getElementById(id).style.display='none'; }
+function fecharModalAdd() { document.getElementById('newNome').value = ''; document.getElementById('newCPF').value = ''; closeModal('modalAdd'); }
+function fecharModalConflito() { document.getElementById('newNome').value = ''; document.getElementById('newCPF').value = ''; closeModal('modalConflito'); }
+
+function salvarAluno() {
+  const nome = document.getElementById('newNome').value;
+  const cpf = document.getElementById('newCPF').value; 
+  const turma = document.getElementById('turmaFiltro').value;
+  if(!nome) return showToast("O Nome é obrigatório.", "error");
+  
+  google.script.run.withSuccessHandler(res => {
+    if(res.success) { 
+      fecharModalAdd(); showToast("Aluno Adicionado!", "success"); carregarDados(); 
+    }
+    else if(res.conflict) {
+      conflitoTemp = { aluno: nome, origem: res.turmaAtual, destino: turma, idExistente: res.idExistente, cpfInput: cpf };
+      let html = `<p style="color:#555;">Encontramos esse nome em outra(s) turma(s). Identifique se é a mesma pessoa:</p>`;
+      res.matches.forEach((m, idx) => {
+         html += `<div style="background:#f9f9f9; padding:10px; border:1px solid #ddd; margin-bottom:5px; border-radius:5px;">
+           <label style="cursor:pointer; display:flex; align-items:center; gap:10px;">
+             <input type="radio" name="conflictRadio" value="${m.id}" data-turma="${m.turma}" ${idx===0?'checked':''}>
+             <span>Turma: <b>${m.turma}</b> <br><small style="color:#888;">CPF cadastrado: ${m.cpf}</small></span>
+           </label>
+         </div>`;
+      });
+      document.getElementById('msgConflito').innerHTML = html;
+      closeModal('modalAdd'); document.getElementById('modalConflito').style.display='flex';
+    } else { showToast(res.message, "error"); }
+  }).adicionarPessoa(nome, turma, cpf);
+}
+
+function resolver(acao) {
+  const radios = document.getElementsByName('conflictRadio');
+  let selectedId = null; let selectedTurma = null;
+  for(let i=0; i<radios.length; i++) {
+    if(radios[i].checked) { selectedId = radios[i].value; selectedTurma = radios[i].getAttribute('data-turma'); break; }
+  }
+  if(!selectedId && acao !== 'novo') return showToast("Selecione um aluno da lista", "error");
+
+  google.script.run.withSuccessHandler(res => { 
+    showToast(res.message, "success"); fecharModalConflito(); carregarDados(); 
+  }).moverPessoa(conflitoTemp.aluno, selectedTurma, conflitoTemp.destino, acao, selectedId, conflitoTemp.cpfInput);
+}
+
+function editarNome(id, antigo) {
+  const novo = prompt("Editando nome (Maiúsculas formatadas automaticamente):", antigo);
+  if(novo && novo.trim() !== antigo) google.script.run.withSuccessHandler(res => { showToast(res.message, "success"); carregarDados(); }).editarNomeAlunoPorId(id, novo);
+}
+function remover(id, aluno) {
+  if(confirm("Deseja EXCLUIR " + aluno + " do sistema?")) google.script.run.withSuccessHandler(res=>{ showToast(res.message, res.success?"success":"error"); carregarDados(); }).removerPessoa(id, aluno);
+}
+
+function modalMetas() {
+  google.script.run.withSuccessHandler(ts => {
+    let html = '';
+    ts.forEach(t => html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:10px 0; border-bottom:1px solid #eee; padding-bottom:10px;"><label style="font-weight:bold; color:#1a5151;">${t.nome}</label><input id="meta_${t.nome}" value="${t.esperados}" style="width:80px; padding:8px; border-radius:5px; border:2px solid #ccc; text-align:center; font-size:16px;"></div>`);
+    document.getElementById('metasBody').innerHTML = html;
+    document.getElementById('modalMetas').style.display='flex';
+  }).getTurmasComEsperados();
+}
+function salvarMetas() {
+  const inputs = document.querySelectorAll('#metasBody input');
+  let m = {};
+  inputs.forEach(i => m[i.id.replace('meta_', '')] = i.value);
+  google.script.run.withSuccessHandler(() => {
+    closeModal('modalMetas'); document.getElementById('modalGraficoChoice').style.display='flex';
+  }).salvarMetasTurmas(m);
+}
+
+function abrirRelatorioNovaAba(tipo) {
+  closeModal('modalGraficoChoice');
+  showToast("Construindo Relatório... Verifique os bloqueadores de popup.", "success");
+  google.script.run.withSuccessHandler(res => {
+    const d = { data: document.getElementById('data').value, municipio: document.getElementById('municipio').value, logo1: logos.logo1, logo2: logos.logo2 };
+    const htmlContent = montarHTMLRelatorio(res.relatorio, tipo, d);
+    let w = window.open('', '_blank'); 
+    if(w) { w.document.write(htmlContent); w.document.close(); setTimeout(() => w.print(), 1500); }
+    else { alert("Pop-up bloqueado pelo navegador! Por favor, libere os pop-ups para este site e tente novamente."); }
+  }).gerarRelatorioAnalytics();
+}
+
+function montarHTMLRelatorio(r, tipo, d) {
+  let dataFmt = d.data ? d.data.split('-').reverse().join('/') : '___/___/___';
+  let title = tipo === 'pie' ? "RELATÓRIO DE ESTATÍSTICAS (GRÁFICO DE PIZZA)" : "RELATÓRIO DE ESTATÍSTICAS (BARRAS)";
+  
+  let header = `
+    <table style="width:100%; border-bottom:3px solid #229783; margin-bottom:20px; border-collapse:collapse; border:none;">
+       <tr>
+         <td style="width:25%; text-align:left; border:none; vertical-align:middle; padding-bottom:10px;">
+            <img src="https://i.postimg.cc/W3QnQkr3/Prancheta-2.png" style="height:70px;">
+         </td>
+         <td style="width:50%; text-align:center; border:none; vertical-align:middle; padding-bottom:10px;">
+            <h2 style="margin:0; color:#1a5151; font-family:Arial,sans-serif; font-size:18px;">${title}</h2>
+            <p style="margin:5px 0 0 0; color:#666; font-family:Arial,sans-serif; font-size:12px;">Data: ${dataFmt} | Município: ${d.municipio || '___'}</p>
+         </td>
+         <td style="width:25%; text-align:right; border:none; vertical-align:middle; white-space:nowrap; padding-bottom:10px;">
+            ${d.logo1 ? '<img src="'+d.logo1+'" style="height:60px; display:inline-block; margin-left:5px; vertical-align:middle;">' : ''}
+            ${d.logo2 ? '<img src="'+d.logo2+'" style="height:60px; display:inline-block; margin-left:5px; vertical-align:middle;">' : ''}
+         </td>
+       </tr>
+    </table>`;
+
+  let html = `<div style="font-family:Arial,sans-serif; color:#333; -webkit-print-color-adjust:exact; print-color-adjust:exact;">${header}`;
+
+  const getColor = (perc) => {
+    if(perc <= 50) return '#e74c3c'; 
+    if(perc <= 70) return '#f1c40f'; 
+    if(perc <= 100) return '#27ae60'; 
+    return '#3498db'; 
+  };
+
+  r.statsPorTurma.forEach((t) => {
+    if(t.graficos.length === 0) return; 
+    
+    html += `<div style="page-break-inside:avoid; border:1px solid #eaeaea; border-radius:8px; margin-bottom:20px;">
+       <div style="border-bottom:1px solid #eaeaea; padding:12px; font-weight:bold; display:flex; justify-content:space-between; align-items:center;">
+         <div style="display:flex; align-items:center; gap:10px;"><div style="width:15px; height:15px; background-color:${t.cor}; border-radius:3px;"></div> <span style="font-size:16px;">${t.turma}</span></div>
+       </div>
+       <div style="padding:20px; display:flex; justify-content:space-around; align-items:flex-start; flex-wrap:wrap; gap:15px;">`;
+       
+    t.graficos.forEach((g) => {
+      let corG = getColor(g.perc);
+      if(tipo === 'pie') {
+        html += `
+          <div style="text-align:center; flex:1; min-width:140px;">
+             <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:15px; text-transform:uppercase;">${g.nomeGrupo}</div>
+             <div style="width:140px; height:140px; border-radius:50%; background:conic-gradient(${corG} ${Math.min(g.perc,100)}%, #f5f5f5 0); display:flex; align-items:center; justify-content:center; margin:0 auto;">
+                <div style="width:90px; height:90px; border-radius:50%; background:white; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:18px; color:${corG};">${g.perc}%</div>
+             </div>
+             <div style="font-size:13px; color:#555; margin-top:15px;">esperados <b>${t.esperados}</b> / presentes <b>${g.presentes}</b></div>
+          </div>`;
+      } else {
+        html += `
+          <div style="width:100%; flex:1; min-width:250px; margin-bottom:10px;">
+             <div style="display:flex; justify-content:space-between; font-size:14px; color:#555; margin-bottom:5px; text-transform:uppercase;"><span>${g.nomeGrupo} (esperados ${t.esperados} / presentes ${g.presentes})</span><span style="color:${corG}; font-weight:bold;">${g.perc}%</span></div>
+             <div style="width:100%; height:25px; background:#f5f5f5; border-radius:5px; overflow:hidden;"><div style="width:${Math.min(g.perc,100)}%; height:100%; background:${corG};"></div></div>
+          </div>`;
+      }
+    });
+    html += `</div></div>`;
+  });
+  
+  html += `<div style="page-break-before:always;"></div>`;
+  html += `<div style="page-break-inside:avoid;">`; 
+  html += `<h2 style="text-align:center; color:#1a5151; margin-top:20px; text-transform:uppercase;">Destaques por Turno</h2>
+           <div style="display:flex; justify-content:center; gap:20px; margin-bottom:30px; flex-wrap:wrap;">`;
+           
+  r.listaGrupos.forEach(g => {
+    if(r.destaquesPorGrupo[g]) {
+       let dGrp = r.destaquesPorGrupo[g];
+       let corD = getColor(dGrp.perc);
+       html += `<div style="border:1px solid #ddd; padding:15px; border-radius:8px; width:250px; text-align:center; border-top:5px solid ${corD}; box-shadow:0 2px 5px rgba(0,0,0,0.05); background:#fff;"><div style="font-size:12px; color:#666; text-transform:uppercase; font-weight:bold;">🏆 Melhor ${g}</div><div style="font-size:18px; font-weight:bold; color:#333; margin:8px 0;">${dGrp.turma}</div><div style="font-size:24px; color:${corD}; font-weight:bold;">${dGrp.perc}%</div><div style="font-size:12px; color:#999; margin-top:5px;">esperados ${dGrp.esperados} / presentes ${dGrp.presentes}</div></div>`;
+    }
+  });
+  html += `</div>`;
+  
+  if(r.turmasAtencao.length > 0) {
+    html += `<h3 style="text-align:center; color:#e74c3c; text-transform:uppercase; letter-spacing:1px; margin-top:30px; border-top:1px solid #eee; padding-top:20px;">⚠️ Requer Atenção (Abaixo de 70%)</h3>
+             <div style="display:flex; flex-wrap:wrap; gap:15px; justify-content:center;">`;
+    r.turmasAtencao.forEach(at => {
+      html += `<div style="border:1px solid #eee; padding:15px; border-radius:8px; width:250px; text-align:center; border-left:4px solid #e74c3c; background:#fafafa;"><div style="font-weight:bold; color:#333; margin-bottom:8px; font-size:14px;">${at.turma}</div><div style="font-size:12px; color:#e74c3c;">`;
+      html += `${at.details}</div></div>`;
+    });
+    html += `</div>`;
+  }
+  html += `</div></div></body></html>`;
+  return html;
+}
+
+function gerarPDF() {
+  const d = { data: document.getElementById('data').value, municipio: document.getElementById('municipio').value, logo1: logos.logo1, logo2: logos.logo2 };
+  google.script.run.salvarConfiguracoes(d);
+  showToast("Gerando PDF... Aguarde.", "success");
+  google.script.run.withSuccessHandler(res => { let w = window.open('', '_blank'); if(w){ w.document.write(res.html); w.document.close(); setTimeout(()=>w.print(),1500); } else {alert("Pop-up bloqueado!");} }).gerarPDF(d);
+}
+function gerarPDFCompacto() {
+  const d = { data: document.getElementById('data').value, municipio: document.getElementById('municipio').value, logo1: logos.logo1, logo2: logos.logo2 };
+  showToast("Gerando PDF... Aguarde.", "success");
+  google.script.run.withSuccessHandler(res => { let w = window.open('', '_blank'); if(w){ w.document.write(res.html); w.document.close(); setTimeout(()=>w.print(),1500); } else {alert("Pop-up bloqueado!");} }).gerarPDFCompacto(d);
+}
+</script>
