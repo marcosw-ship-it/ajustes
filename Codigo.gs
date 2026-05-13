@@ -83,19 +83,22 @@ function adicionarPessoa(aluno, turma, cpf) {
     lock.waitLock(5000);
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName('BANCO DE DADOS');
+    
+    if (!sheet) return { success: false, message: "Planilha BANCO DE DADOS não encontrada." };
+
     const nomeFormatado = formatarNome(aluno.trim());
     const cpfInput = cpf ? cpf.trim() : "";
     const data = sheet.getDataRange().getValues();
     
+    // 1. Verificação de Duplicados/Conflitos
     let matches = [];
     let jaExisteNestaTurma = false;
-
     for (let i = 1; i < data.length; i++) {
       const nomePlanilha = data[i][1] ? data[i][1].toString().toLowerCase().trim() : "";
       const cpfPlanilha = data[i][3] ? data[i][3].toString().trim() : "";
       
       if (nomePlanilha === nomeFormatado.toLowerCase()) {
-        if (cpfInput !== "" && cpfPlanilha !== "" && cpfInput !== cpfPlanilha) continue; 
+        if (cpfInput !== "" && cpfPlanilha !== "" && cpfInput !== cpfPlanilha) continue;
         if (data[i][2].toString().trim() === turma) { jaExisteNestaTurma = true; break; }
         matches.push({ id: data[i][0], turma: data[i][2], cpf: cpfPlanilha || "Sem CPF cadastrado" });
       }
@@ -111,15 +114,37 @@ function adicionarPessoa(aluno, turma, cpf) {
       };
     }
 
-    const id = Utilities.getUuid(); 
-    const row = [id, nomeFormatado, turma, cpfInput];
-    const total = sheet.getLastColumn();
-    for(let i=4; i<total; i++) row.push('Faltou');
-    sheet.appendRow(row);
+    // 2. Lógica de Inserção Corrigida
+    const id = Utilities.getUuid();
+    const totalColunas = sheet.getLastColumn();
+    const colunasFreq = getColunasFrequencia(); // Obtém apenas colunas de turno
+    
+    // Cria um array vazio com o tamanho exato da planilha
+    let novaLinha = new Array(totalColunas).fill("");
+    
+    // Preenche os dados fixos
+    novaLinha[0] = id;           // Coluna ID
+    novaLinha[1] = nomeFormatado; // Coluna ALUNO
+    novaLinha[2] = turma;         // Coluna TURMA
+    novaLinha[3] = cpfInput;      // Coluna CPF
+
+    // Preenche "Faltou" APENAS nas colunas que o sistema reconhece como frequência
+    colunasFreq.forEach(col => {
+      if (col.index < totalColunas) {
+        novaLinha[col.index] = 'Faltou';
+      }
+    });
+
+    sheet.appendRow(novaLinha);
     SpreadsheetApp.flush();
+    
     return { success: true, message: "Adicionado com sucesso!" };
-  } catch(e) { return { success: false, message: e.toString() }; }
-  finally { lock.releaseLock(); }
+
+  } catch(e) { 
+    return { success: false, message: e.toString() }; 
+  } finally { 
+    lock.releaseLock();
+  }
 }
 
 function moverPessoa(aluno, origem, destino, acao, idExistente, cpfInput) {
